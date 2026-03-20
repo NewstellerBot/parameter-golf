@@ -22,7 +22,6 @@ if [ ! -d parameter-golf ]; then
     git clone https://github.com/NewstellerBot/parameter-golf.git
 fi
 cd parameter-golf
-git pull --ff-only 2>/dev/null || true
 
 # Download full dataset (all 80 training shards)
 if [ ! -f data/datasets/fineweb10B_sp1024/fineweb_train_000000.bin ]; then
