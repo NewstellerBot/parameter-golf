@@ -1134,7 +1134,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not HAS_TRITON)
+    if HAS_TRITON:
+        compiled_model = base_model  # Triton kernels replace torch.compile fusion
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1378,7 +1381,10 @@ def main() -> None:
             new_params = args.model_dim * args.model_dim + args.model_dim
             log0(f"  layer {li}: R²={r2:.4f} samples={n_samples} saved_params={old_params - new_params:,}")
         # Recompile after architecture change
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not HAS_TRITON)
+        if HAS_TRITON:
+            compiled_model = base_model
+        else:
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
         model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
         n_params_new = sum(p.numel() for p in base_model.parameters())
         log0(f"  model_params after linearization: {n_params_new:,} (was {n_params:,}, saved {n_params - n_params_new:,})")
