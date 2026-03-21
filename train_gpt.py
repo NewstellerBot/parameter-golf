@@ -603,33 +603,24 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-# QAT: fake-quantize weights during forward pass so the model learns to be robust to int6.
-# Uses BitNet-style lambda warmup: quantization ramps from 0% to 100% over first 50% of training.
+# QAT: fake-quantize weights during the warmdown phase so the model learns quantization robustness.
+# Enabled only during the last portion of training (when LR is already decaying).
+# This avoids: (1) training instability from early quantization, (2) torch.compile recompilation.
 _QAT_ENABLED = False
 _QAT_BITS = 6
-_QAT_LAMBDA = 0.0  # 0.0 = full precision, 1.0 = fully quantized
-
-def fake_quantize_ste(w: Tensor, bits: int = 6, lam: float = 1.0) -> Tensor:
-    """STE fake quantization with lambda warmup (BitNet-style)."""
-    max_val = (2 ** (bits - 1)) - 1  # int6: 31
-    if w.ndim == 2:
-        scale = w.detach().abs().amax(dim=1, keepdim=True) / max_val
-        scale = scale.clamp_min(1.0 / max_val)
-    else:
-        scale = w.detach().abs().max() / max_val
-        scale = max(scale, 1.0 / max_val)
-    w_q = (w / scale).round().clamp(-max_val, max_val) * scale
-    # Lambda warmup: blend between original and quantized
-    return w + (lam * (w_q - w)).detach()
 
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # When QAT is enabled, fake-quantize weights with lambda warmup.
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if _QAT_ENABLED and self.weight.ndim == 2 and self.weight.numel() > 65_536:
-            w = fake_quantize_ste(w, bits=_QAT_BITS, lam=_QAT_LAMBDA)
+            # STE: quantized forward, identity backward. Applied as a fixed transform
+            # (no lambda), only active during warmdown when weights are stable.
+            max_val = (2 ** (_QAT_BITS - 1)) - 1
+            scale = w.detach().abs().amax(dim=1, keepdim=True).clamp_min(1.0 / max_val) / max_val
+            w_q = (w / scale).round().clamp(-max_val, max_val) * scale
+            w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
@@ -1260,13 +1251,10 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
-    # Enable QAT after warmup. Lambda ramps 0→1 over first 50% of training (BitNet-style).
+    # QAT activates during warmdown phase (not from the start).
+    qat_activated = False
     if args.qat_bits > 0:
-        global _QAT_ENABLED, _QAT_BITS, _QAT_LAMBDA
-        _QAT_ENABLED = True
-        _QAT_BITS = args.qat_bits
-        _QAT_LAMBDA = 0.0  # starts at 0 (full precision), ramps to 1
-        log0(f"qat:enabled bits={args.qat_bits} warmup=linear_50pct")
+        log0(f"qat:will_enable bits={args.qat_bits} trigger=warmdown_start")
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1311,14 +1299,13 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
 
-        # QAT lambda warmup: ramp 0→1 over first 50% of estimated total steps
-        if _QAT_ENABLED:
-            if max_wallclock_ms is not None and step > 0:
-                step_ms = elapsed_ms / step
-                est_total_steps = max_wallclock_ms / step_ms
-                _QAT_LAMBDA = min(2.0 * step / max(est_total_steps, 1), 1.0)
-            else:
-                _QAT_LAMBDA = min(2.0 * step / max(args.iterations, 1), 1.0)
+        # Enable QAT once warmdown begins (scale < 1.0). One-time trigger.
+        if args.qat_bits > 0 and not qat_activated and scale < 1.0:
+            global _QAT_ENABLED, _QAT_BITS
+            _QAT_ENABLED = True
+            _QAT_BITS = args.qat_bits
+            qat_activated = True
+            log0(f"qat:activated at step {step} (warmdown started, lr_scale={scale:.4f})")
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
