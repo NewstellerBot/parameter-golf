@@ -97,6 +97,8 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
     muon_wd = float(os.environ.get("MUON_WD", 0.02))
+    # QAT: fake-quantize weights during training (0=off, 6=int6, 4=int4, 3=ternary).
+    qat_bits = int(os.environ.get("QAT_BITS", 6))
     # Post-training MLP linearization: comma-separated layer indices (empty = disabled).
     # Replaces specified MLP layers with fitted linear approximations before quantization.
     linearize_mlp_layers = os.environ.get("LINEARIZE_MLP_LAYERS", "")
@@ -601,11 +603,32 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+# QAT: fake-quantize weights during forward pass so the model learns to be robust to int6.
+_QAT_ENABLED = False
+_QAT_BITS = 6
+
+def fake_quantize_ste(w: Tensor, bits: int = 6) -> Tensor:
+    """STE fake quantization: quantize in forward, identity in backward."""
+    max_val = (2 ** (bits - 1)) - 1  # int6: 31
+    if w.ndim == 2:
+        scale = w.detach().abs().amax(dim=1, keepdim=True) / max_val
+        scale = scale.clamp_min(1.0 / max_val)
+    else:
+        scale = w.detach().abs().max() / max_val
+        scale = max(scale, 1.0 / max_val)
+    w_q = (w / scale).round().clamp(-max_val, max_val) * scale
+    return w + (w_q - w).detach()  # STE: quantized forward, gradient flows through w
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # When QAT is enabled, fake-quantize weights so the model learns quantization robustness.
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if _QAT_ENABLED and self.weight.ndim == 2 and self.weight.numel() > 65_536:
+            w = fake_quantize_ste(w, bits=_QAT_BITS)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1234,6 +1257,13 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    # Enable QAT after warmup so the model trains with fake-quantized weights.
+    if args.qat_bits > 0:
+        global _QAT_ENABLED, _QAT_BITS
+        _QAT_ENABLED = True
+        _QAT_BITS = args.qat_bits
+        log0(f"qat:enabled bits={args.qat_bits}")
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1363,8 +1393,8 @@ def main() -> None:
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # Disable QAT for serialization — we're saving real weights now.
+    _QAT_ENABLED = False
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
