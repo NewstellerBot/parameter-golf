@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+FROM nvcr.io/nvidia/pytorch:25.03-py3
 
 WORKDIR /workspace/parameter-golf
 
