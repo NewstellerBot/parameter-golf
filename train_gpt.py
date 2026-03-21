@@ -27,6 +27,14 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Try to import Triton for fused kernels; fall back to plain PyTorch.
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -521,6 +529,95 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
+# -----------------------------
+# FUSED TRITON KERNELS
+# -----------------------------
+
+if HAS_TRITON:
+    @triton.jit
+    def _relu_square_kernel(x_ptr, out_ptr, n: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * n + tl.arange(0, n)
+        x = tl.load(x_ptr + offs)
+        r = tl.where(x > 0, x, 0.0)
+        tl.store(out_ptr + offs, r * r)
+
+    @triton.jit
+    def _residual_mix_kernel(
+        x_ptr, x0_ptr, mix0_ptr, mix1_ptr, out_ptr,
+        seq_tokens, dim: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        offs = tl.arange(0, dim)
+        x = tl.load(x_ptr + row * dim + offs)
+        x0 = tl.load(x0_ptr + row * dim + offs)
+        m0 = tl.load(mix0_ptr + offs)
+        m1 = tl.load(mix1_ptr + offs)
+        tl.store(out_ptr + row * dim + offs, m0 * x + m1 * x0)
+
+    @triton.jit
+    def _scale_residual_kernel(
+        x_ptr, branch_ptr, scale_ptr, out_ptr,
+        seq_tokens, dim: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        offs = tl.arange(0, dim)
+        x = tl.load(x_ptr + row * dim + offs)
+        b = tl.load(branch_ptr + row * dim + offs)
+        s = tl.load(scale_ptr + offs)
+        tl.store(out_ptr + row * dim + offs, x + s * b)
+
+
+def fused_relu_square(x: Tensor) -> Tensor:
+    """relu(x)² in a single kernel — avoids materializing the relu intermediate."""
+    if HAS_TRITON and x.is_cuda and x.is_contiguous():
+        out = torch.empty_like(x)
+        n = x.shape[-1]
+        # Triton constexpr requires power-of-2; pad the block size
+        n_po2 = triton.next_power_of_2(n)
+        # Only use triton when last dim is the block (simple flat rows)
+        if n == n_po2 and x.ndim >= 2:
+            total_rows = x.numel() // n
+            _relu_square_kernel[(total_rows,)](x, out, n)
+            return out
+    # Fallback
+    return torch.relu(x).square()
+
+
+def fused_residual_mix(x: Tensor, x0: Tensor, mix: Tensor) -> Tensor:
+    """mix[0]*x + mix[1]*x0 in a single kernel."""
+    if HAS_TRITON and x.is_cuda and x.is_contiguous() and x0.is_contiguous():
+        dim = x.shape[-1]
+        if dim == triton.next_power_of_2(dim):
+            flat_x = x.reshape(-1, dim)
+            flat_x0 = x0.reshape(-1, dim)
+            out = torch.empty_like(flat_x)
+            total_rows = flat_x.shape[0]
+            _residual_mix_kernel[(total_rows,)](
+                flat_x, flat_x0, mix[0], mix[1], out, total_rows, dim,
+            )
+            return out.view_as(x)
+    # Fallback
+    return mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+
+def fused_scale_residual(x: Tensor, branch: Tensor, scale: Tensor) -> Tensor:
+    """x + scale * branch in a single kernel."""
+    if HAS_TRITON and x.is_cuda and x.is_contiguous() and branch.is_contiguous():
+        dim = x.shape[-1]
+        if dim == triton.next_power_of_2(dim):
+            flat_x = x.reshape(-1, dim)
+            flat_b = branch.reshape(-1, dim)
+            out = torch.empty_like(flat_x)
+            total_rows = flat_x.shape[0]
+            _scale_residual_kernel[(total_rows,)](
+                flat_x, flat_b, scale, out, total_rows, dim,
+            )
+            return out.view_as(x)
+    # Fallback
+    return x + scale[None, None, :] * branch
+
+
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -646,8 +743,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.proj(fused_relu_square(self.fc(x)))
 
 
 class LinearMLP(nn.Module):
@@ -683,10 +779,9 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = fused_residual_mix(x, x0, mix)
+        x = fused_scale_residual(x, self.attn(self.attn_norm(x)), self.attn_scale.to(dtype=x.dtype))
+        x = fused_scale_residual(x, self.mlp(self.mlp_norm(x)), self.mlp_scale.to(dtype=x.dtype))
         return x
 
 
@@ -1039,7 +1134,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not HAS_TRITON)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1283,7 +1378,7 @@ def main() -> None:
             new_params = args.model_dim * args.model_dim + args.model_dim
             log0(f"  layer {li}: R²={r2:.4f} samples={n_samples} saved_params={old_params - new_params:,}")
         # Recompile after architecture change
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not HAS_TRITON)
         model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
         n_params_new = sum(p.numel() for p in base_model.parameters())
         log0(f"  model_params after linearization: {n_params_new:,} (was {n_params:,}, saved {n_params - n_params_new:,})")
