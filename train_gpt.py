@@ -530,12 +530,12 @@ class DistributedTokenLoader:
 # -----------------------------
 
 # -----------------------------
-# FUSED TRITON KERNELS
+# FUSED TRITON KERNELS (with autograd support)
 # -----------------------------
 
 if HAS_TRITON:
     @triton.jit
-    def _relu_square_kernel(x_ptr, out_ptr, n: tl.constexpr):
+    def _relu_square_fwd_kernel(x_ptr, out_ptr, n: tl.constexpr):
         pid = tl.program_id(0)
         offs = pid * n + tl.arange(0, n)
         x = tl.load(x_ptr + offs)
@@ -543,78 +543,52 @@ if HAS_TRITON:
         tl.store(out_ptr + offs, r * r)
 
     @triton.jit
-    def _residual_mix_kernel(
-        x_ptr, x0_ptr, mix0_ptr, mix1_ptr, out_ptr,
-        seq_tokens, dim: tl.constexpr,
-    ):
-        row = tl.program_id(0)
-        offs = tl.arange(0, dim)
-        x = tl.load(x_ptr + row * dim + offs)
-        x0 = tl.load(x0_ptr + row * dim + offs)
-        m0 = tl.load(mix0_ptr + offs)
-        m1 = tl.load(mix1_ptr + offs)
-        tl.store(out_ptr + row * dim + offs, m0 * x + m1 * x0)
+    def _relu_square_bwd_kernel(x_ptr, grad_out_ptr, grad_in_ptr, n: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * n + tl.arange(0, n)
+        x = tl.load(x_ptr + offs)
+        go = tl.load(grad_out_ptr + offs)
+        r = tl.where(x > 0, x, 0.0)
+        # d/dx relu(x)^2 = 2*relu(x) * (x > 0)
+        tl.store(grad_in_ptr + offs, 2.0 * r * go)
 
-    @triton.jit
-    def _scale_residual_kernel(
-        x_ptr, branch_ptr, scale_ptr, out_ptr,
-        seq_tokens, dim: tl.constexpr,
-    ):
-        row = tl.program_id(0)
-        offs = tl.arange(0, dim)
-        x = tl.load(x_ptr + row * dim + offs)
-        b = tl.load(branch_ptr + row * dim + offs)
-        s = tl.load(scale_ptr + offs)
-        tl.store(out_ptr + row * dim + offs, x + s * b)
+    class _FusedReluSquare(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            ctx.save_for_backward(x)
+            n = x.shape[-1]
+            if x.is_cuda and x.is_contiguous() and n == triton.next_power_of_2(n) and x.ndim >= 2:
+                out = torch.empty_like(x)
+                _relu_square_fwd_kernel[(x.numel() // n,)](x, out, n)
+                return out
+            return torch.relu(x).square()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x, = ctx.saved_tensors
+            n = x.shape[-1]
+            if x.is_cuda and x.is_contiguous() and grad_output.is_contiguous() and n == triton.next_power_of_2(n):
+                grad_in = torch.empty_like(x)
+                _relu_square_bwd_kernel[(x.numel() // n,)](x, grad_output, grad_in, n)
+                return grad_in
+            relu_x = torch.relu(x)
+            return 2.0 * relu_x * grad_output
 
 
 def fused_relu_square(x: Tensor) -> Tensor:
-    """relu(x)² in a single kernel — avoids materializing the relu intermediate."""
-    if HAS_TRITON and x.is_cuda and x.is_contiguous():
-        out = torch.empty_like(x)
-        n = x.shape[-1]
-        # Triton constexpr requires power-of-2; pad the block size
-        n_po2 = triton.next_power_of_2(n)
-        # Only use triton when last dim is the block (simple flat rows)
-        if n == n_po2 and x.ndim >= 2:
-            total_rows = x.numel() // n
-            _relu_square_kernel[(total_rows,)](x, out, n)
-            return out
-    # Fallback
+    """relu(x)² with fused Triton forward+backward."""
+    if HAS_TRITON and x.is_cuda:
+        return _FusedReluSquare.apply(x)
     return torch.relu(x).square()
 
 
 def fused_residual_mix(x: Tensor, x0: Tensor, mix: Tensor) -> Tensor:
-    """mix[0]*x + mix[1]*x0 in a single kernel."""
-    if HAS_TRITON and x.is_cuda and x.is_contiguous() and x0.is_contiguous():
-        dim = x.shape[-1]
-        if dim == triton.next_power_of_2(dim):
-            flat_x = x.reshape(-1, dim)
-            flat_x0 = x0.reshape(-1, dim)
-            out = torch.empty_like(flat_x)
-            total_rows = flat_x.shape[0]
-            _residual_mix_kernel[(total_rows,)](
-                flat_x, flat_x0, mix[0], mix[1], out, total_rows, dim,
-            )
-            return out.view_as(x)
-    # Fallback
+    """mix[0]*x + mix[1]*x0 — pure PyTorch (autograd-safe, torch.compile friendly)."""
     return mix[0][None, None, :] * x + mix[1][None, None, :] * x0
 
 
 def fused_scale_residual(x: Tensor, branch: Tensor, scale: Tensor) -> Tensor:
-    """x + scale * branch in a single kernel."""
-    if HAS_TRITON and x.is_cuda and x.is_contiguous() and branch.is_contiguous():
-        dim = x.shape[-1]
-        if dim == triton.next_power_of_2(dim):
-            flat_x = x.reshape(-1, dim)
-            flat_b = branch.reshape(-1, dim)
-            out = torch.empty_like(flat_x)
-            total_rows = flat_x.shape[0]
-            _scale_residual_kernel[(total_rows,)](
-                flat_x, flat_b, scale, out, total_rows, dim,
-            )
-            return out.view_as(x)
-    # Fallback
+    """x + scale * branch — pure PyTorch (autograd-safe, torch.compile friendly)."""
     return x + scale[None, None, :] * branch
 
 
@@ -1134,10 +1108,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    if HAS_TRITON:
-        compiled_model = base_model  # Triton kernels replace torch.compile fusion
-    else:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
