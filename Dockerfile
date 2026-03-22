@@ -1,14 +1,9 @@
-FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+FROM nvcr.io/nvidia/pytorch:25.03-py3
 
 WORKDIR /workspace/parameter-golf
 
-# System deps
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
-
-# Python deps (from requirements.txt + triton)
-RUN pip install --no-cache-dir \
-    numpy tqdm sentencepiece huggingface-hub datasets \
-    tiktoken setuptools typing-extensions==4.15.0 triton
+# Only install what the NGC image doesn't already have
+RUN pip install --no-cache-dir sentencepiece huggingface-hub datasets tiktoken
 
 # Copy our code
 COPY train_gpt.py .
