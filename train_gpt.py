@@ -409,9 +409,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
-        # Everything else: int6 quantization (saves ~25% vs int8)
+        # Quantize at the configured bit width (default int6, or match QAT_BITS)
+        export_bits = int(os.environ.get("QAT_BITS", 6)) or 6
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t, bits=6)
+        q, s = quantize_float_tensor(t, bits=export_bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
