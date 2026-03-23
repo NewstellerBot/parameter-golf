@@ -448,19 +448,43 @@ try:
     from mamba_ssm import Mamba
     HAS_MAMBA = True
 
-    # Register Mamba's custom CUDA kernels with torch.compile so it doesn't break the graph.
+    # Mark Mamba's forward as a graph break boundary that torch.compile won't try to trace into.
+    # This avoids the "Dynamo does not know how to trace selective_scan_cuda" error.
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = False
+
+    # Find and register ALL the underlying CUDA functions
+    import mamba_ssm.ops.selective_scan_interface as _ssi
+    for name in dir(_ssi):
+        obj = getattr(_ssi, name)
+        if callable(obj) and not name.startswith('_'):
+            try:
+                torch.compiler.allow_in_graph(obj)
+            except Exception:
+                pass
     try:
-        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
-        torch.compiler.allow_in_graph(selective_scan_fn)
-        torch.compiler.allow_in_graph(mamba_inner_fn)
-    except (ImportError, AttributeError):
+        import causal_conv1d_cuda
+        for name in dir(causal_conv1d_cuda):
+            obj = getattr(causal_conv1d_cuda, name)
+            if callable(obj):
+                try:
+                    torch.compiler.allow_in_graph(obj)
+                except Exception:
+                    pass
+    except ImportError:
         pass
     try:
-        from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-        torch.compiler.allow_in_graph(causal_conv1d_fn)
-        torch.compiler.allow_in_graph(causal_conv1d_update)
-    except (ImportError, AttributeError):
+        import selective_scan_cuda
+        for name in dir(selective_scan_cuda):
+            obj = getattr(selective_scan_cuda, name)
+            if callable(obj):
+                try:
+                    torch.compiler.allow_in_graph(obj)
+                except Exception:
+                    pass
+    except ImportError:
         pass
+
 except ImportError:
     HAS_MAMBA = False
 
@@ -473,6 +497,7 @@ class MambaAttention(nn.Module):
             raise RuntimeError("mamba_ssm not installed: pip install mamba-ssm causal-conv1d")
         self.mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
 
+    @torch._dynamo.disable
     def forward(self, x):
         return self.mamba(x)
 
@@ -647,7 +672,8 @@ def main():
 
     # NOTE: fullgraph=True may not work with the sequential linear attention loop.
     # Use dynamic=False without fullgraph for hybrid.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # fullgraph=False because Mamba layers use @torch._dynamo.disable (graph breaks)
+    compiled_model = torch.compile(base_model, dynamic=False)
     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     n_params = sum(p.numel() for p in base_model.parameters())
