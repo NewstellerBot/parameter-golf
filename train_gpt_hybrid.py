@@ -444,84 +444,23 @@ class FullAttention(nn.Module):
         return self.proj(y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim))
 
 
-class LinearAttention(nn.Module):
-    """Simplified Gated DeltaNet-style linear attention (chunk-parallel)."""
-    def __init__(self, dim, num_heads, conv_kernel=4):
+try:
+    from mamba_ssm import Mamba
+    HAS_MAMBA = True
+except ImportError:
+    HAS_MAMBA = False
+
+
+class MambaAttention(nn.Module):
+    """Mamba SSM layer — O(n) drop-in replacement for attention, uses fused CUDA kernels."""
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.dim = dim
-
-        # QKV + gate projections
-        self.qkv = CastedLinear(dim, dim * 3, bias=False)
-        self.gate_proj = CastedLinear(dim, dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
-
-        # Causal conv1d on QKV (like Mamba/Qwen3.5)
-        self.conv1d = nn.Conv1d(dim * 3, dim * 3, conv_kernel, groups=dim * 3,
-                                padding=conv_kernel - 1, bias=False)
-
-        # Decay parameters
-        self.dt_bias = nn.Parameter(torch.ones(num_heads))
-        self.A_log = nn.Parameter(torch.empty(num_heads).uniform_(0, 16).log())
+        if not HAS_MAMBA:
+            raise RuntimeError("mamba_ssm not installed: pip install mamba-ssm causal-conv1d")
+        self.mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
 
     def forward(self, x):
-        bsz, seqlen, dim = x.shape
-        H, D = self.num_heads, self.head_dim
-
-        # Project + causal conv
-        qkv = self.qkv(x)
-        qkv = F.silu(self.conv1d(qkv.transpose(1, 2))[:, :, :seqlen]).transpose(1, 2)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        # Gate
-        gate = torch.sigmoid(self.gate_proj(x))
-
-        # Reshape to heads
-        q = q.reshape(bsz, seqlen, H, D)
-        k = k.reshape(bsz, seqlen, H, D)
-        v = v.reshape(bsz, seqlen, H, D)
-
-        # L2 normalize Q, K
-        q = F.normalize(q, dim=-1) * (D ** -0.5)
-        k = F.normalize(k, dim=-1)
-
-        # Compute decay: scalar per head, shaped for state matrix [B, H, D, D]
-        decay = (-self.A_log.float().exp() * F.softplus(self.dt_bias.float())).exp()
-        decay = decay[None, :, None, None]  # [1, H, 1, 1] — broadcasts with [B, H, D, D]
-
-        q = q.transpose(1, 2).contiguous()  # [B, H, T, D]
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-
-        # Recurrent linear attention with exponential decay
-        CHUNK = 64
-        outputs = []
-        S = torch.zeros(bsz, H, D, D, device=x.device, dtype=torch.float32)
-
-        for start in range(0, seqlen, CHUNK):
-            end = min(start + CHUNK, seqlen)
-            q_chunk = q[:, :, start:end].float()
-            k_chunk = k[:, :, start:end].float()
-            v_chunk = v[:, :, start:end].float()
-            chunk_len = end - start
-
-            chunk_out = torch.zeros_like(v_chunk)
-            for t in range(chunk_len):
-                k_t = k_chunk[:, :, t, :]  # [B, H, D]
-                v_t = v_chunk[:, :, t, :]  # [B, H, D]
-                S = S * decay + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)  # [B, H, D, D]
-                chunk_out[:, :, t, :] = torch.einsum('bhd,bhde->bhe', q_chunk[:, :, t, :], S)
-
-            outputs.append(chunk_out)
-
-        y = torch.cat(outputs, dim=2)  # [B, H, T, D]
-        y = y.transpose(1, 2).contiguous().to(x.dtype).reshape(bsz, seqlen, dim)
-
-        # Gated output
-        y = y * gate
-        return self.proj(y)
+        return self.mamba(x)
 
 
 class MLP(nn.Module):
@@ -538,19 +477,19 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                 use_linear_attn=False, conv_kernel=4):
+                 use_mamba=False, conv_kernel=4):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        if use_linear_attn:
-            self.attn = LinearAttention(dim, num_heads, conv_kernel=conv_kernel)
+        if use_mamba:
+            self.attn = MambaAttention(dim)
         else:
             self.attn = FullAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.is_linear = use_linear_attn
+        self.is_mamba = use_mamba
 
     def forward(self, x, x0):
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -580,18 +519,17 @@ class HybridGPT(nn.Module):
         self.blocks = nn.ModuleList([
             Block(args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult,
                   args.rope_base, args.qk_gain_init,
-                  use_linear_attn=(i not in attn_layers),
-                  conv_kernel=args.linear_conv_kernel)
+                  use_mamba=(i not in attn_layers))
             for i in range(num_layers)
         ])
         self.final_norm = RMSNorm()
         self.lm_head = None if args.tie_embeddings else CastedLinear(args.model_dim, args.vocab_size, bias=False)
 
         # Log layer types
-        layer_types = ["attn" if i in attn_layers else "linear" for i in range(num_layers)]
+        layer_types = ["attn" if i in attn_layers else "mamba" for i in range(num_layers)]
         print(f"hybrid_layers: {layer_types}")
         print(f"  {sum(1 for l in layer_types if l == 'attn')} full attention, "
-              f"{sum(1 for l in layer_types if l == 'linear')} linear attention")
+              f"{sum(1 for l in layer_types if l == 'mamba')} mamba SSM")
 
         self._init_weights(args)
 
@@ -695,8 +633,7 @@ def main():
 
     # NOTE: fullgraph=True may not work with the sequential linear attention loop.
     # Use dynamic=False without fullgraph for hybrid.
-    # Skip torch.compile — the sequential linear attention loop can't be compiled
-    compiled_model = base_model
+    compiled_model = torch.compile(base_model, dynamic=False)
     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     n_params = sum(p.numel() for p in base_model.parameters())
