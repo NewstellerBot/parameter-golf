@@ -1373,13 +1373,14 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
 
-        # Enable QAT once warmdown begins (scale < 1.0). One-time trigger.
-        if args.qat_bits > 0 and not qat_activated and scale < 1.0:
+        # Enable QAT at 75% of estimated training time. One-time trigger.
+        qat_frac = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
+        if args.qat_bits > 0 and not qat_activated and qat_frac >= 0.75:
             global _QAT_ENABLED, _QAT_BITS
             _QAT_ENABLED = True
             _QAT_BITS = args.qat_bits
             qat_activated = True
-            log0(f"qat:activated at step {step} (warmdown started, lr_scale={scale:.4f})")
+            log0(f"qat:activated at step {step} (training {qat_frac*100:.0f}% complete, lr_scale={scale:.4f})")
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
