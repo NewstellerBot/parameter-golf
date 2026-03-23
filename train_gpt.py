@@ -19,6 +19,12 @@ import uuid
 import zlib
 from pathlib import Path
 
+try:
+    import zstandard
+    _COMPRESSOR = "zstd"
+except ImportError:
+    _COMPRESSOR = "zlib"
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -99,6 +105,15 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.02))
     # QAT: fake-quantize weights during training (0=off, 6=int6, 4=int4, 3=ternary).
     qat_bits = int(os.environ.get("QAT_BITS", 6))
+    # BigramHash: hash bigram pairs into a learned embedding table. 0=disabled.
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    # SmearGate: blend each token with the previous token's embedding.
+    smeargate = bool(int(os.environ.get("SMEARGATE", "1")))
+    # SWA: Stochastic Weight Averaging during warmdown.
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
+    swa_every = int(os.environ.get("SWA_EVERY", 50))
     # Post-training MLP linearization: comma-separated layer indices (empty = disabled).
     # Replaces specified MLP layers with fitted linear approximations before quantization.
     linearize_mlp_layers = os.environ.get("LINEARIZE_MLP_LAYERS", "")
@@ -738,6 +753,45 @@ class MLP(nn.Module):
         return self.proj(fused_relu_square(self.fc(x)))
 
 
+class BigramHashEmbedding(nn.Module):
+    """Hash consecutive token pairs into a learned embedding table."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
+class SmearGate(nn.Module):
+    """Blend each token's embedding with the previous token's embedding."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
 class LinearMLP(nn.Module):
     """Lightweight linear MLP replacement: saves ~75% params vs full MLP."""
     def __init__(self, dim: int):
@@ -792,6 +846,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_vocab_size: int = 0,
+        bigram_dim: int = 128,
+        use_smeargate: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -800,6 +857,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.smear = SmearGate(model_dim) if use_smeargate else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -845,7 +904,11 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -872,7 +935,11 @@ class GPT(nn.Module):
     @torch.no_grad()
     def get_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
@@ -1121,6 +1188,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        use_smeargate=args.smeargate,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1254,6 +1324,9 @@ def main() -> None:
 
     # QAT activates during warmdown phase (not from the start).
     qat_activated = False
+    # SWA: collect weight snapshots during warmdown for averaging.
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
     if args.qat_bits > 0:
         log0(f"qat:will_enable bits={args.qat_bits} trigger=warmdown_start")
 
@@ -1338,6 +1411,17 @@ def main() -> None:
             with torch.no_grad():
                 for p in matrix_params:
                     p.mul_(1.0 - args.muon_wd * optimizer_muon.param_groups[0]["lr"])
+        # SWA: collect weight snapshots during warmdown
+        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+            if swa_state is None:
+                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                swa_count = 1
+                log0(f"swa:start step:{step}")
+            else:
+                for name, t in base_model.state_dict().items():
+                    swa_state[name] += t.detach().cpu()
+                swa_count += 1
+
         zero_grad_all()
 
         step += 1
@@ -1393,10 +1477,20 @@ def main() -> None:
         log0(f"  model_params after linearization: {n_params_new:,} (was {n_params:,}, saved {n_params - n_params_new:,})")
 
     # -----------------------------
-    # SERIALIZATION + ROUNDTRIP VALIDATION
+    # APPLY SWA + SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Disable QAT for serialization — we're saving real weights now.
     _QAT_ENABLED = False
+
+    # Apply SWA if we collected snapshots
+    if args.swa_enabled and swa_state is not None and swa_count > 1:
+        log0(f"swa:applying averaged {swa_count} checkpoints")
+        current_state = base_model.state_dict()
+        avg_state = {
+            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+            for name, tensor in swa_state.items()
+        }
+        base_model.load_state_dict(avg_state, strict=True)
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1410,7 +1504,7 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw) if _COMPRESSOR == "zstd" else zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1428,7 +1522,8 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk) if _COMPRESSOR == "zstd" else zlib.decompress(quant_blob_disk)
+    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=not bool(linearize_layers))
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
