@@ -447,6 +447,20 @@ class FullAttention(nn.Module):
 try:
     from mamba_ssm import Mamba
     HAS_MAMBA = True
+
+    # Register Mamba's custom CUDA kernels with torch.compile so it doesn't break the graph.
+    try:
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+        torch.compiler.allow_in_graph(selective_scan_fn)
+        torch.compiler.allow_in_graph(mamba_inner_fn)
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+        torch.compiler.allow_in_graph(causal_conv1d_fn)
+        torch.compiler.allow_in_graph(causal_conv1d_update)
+    except (ImportError, AttributeError):
+        pass
 except ImportError:
     HAS_MAMBA = False
 
@@ -633,7 +647,7 @@ def main():
 
     # NOTE: fullgraph=True may not work with the sequential linear attention loop.
     # Use dynamic=False without fullgraph for hybrid.
-    compiled_model = torch.compile(base_model, dynamic=False)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     n_params = sum(p.numel() for p in base_model.parameters())
