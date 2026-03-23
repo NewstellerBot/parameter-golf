@@ -695,7 +695,8 @@ def main():
 
     # NOTE: fullgraph=True may not work with the sequential linear attention loop.
     # Use dynamic=False without fullgraph for hybrid.
-    compiled_model = torch.compile(base_model, dynamic=False)
+    # Skip torch.compile — the sequential linear attention loop can't be compiled
+    compiled_model = base_model
     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     n_params = sum(p.numel() for p in base_model.parameters())
