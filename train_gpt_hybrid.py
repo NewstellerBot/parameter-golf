@@ -487,19 +487,15 @@ class LinearAttention(nn.Module):
         q = F.normalize(q, dim=-1) * (D ** -0.5)
         k = F.normalize(k, dim=-1)
 
-        # Compute decay
+        # Compute decay: scalar per head, shaped for state matrix [B, H, D, D]
         decay = (-self.A_log.float().exp() * F.softplus(self.dt_bias.float())).exp()
-        decay = decay[None, None, :, None]  # [1, 1, H, 1]
+        decay = decay[None, :, None, None]  # [1, H, 1, 1] — broadcasts with [B, H, D, D]
 
-        # Chunk-parallel linear attention
-        # For simplicity, use a cumulative approach that torch.compile can handle
         q = q.transpose(1, 2).contiguous()  # [B, H, T, D]
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
 
-        # Causal linear attention with exponential decay
-        # Compute as: out_t = sum_{s<=t} decay^{t-s} * (k_s^T v_s) @ q_t
-        # We use the recurrent form but vectorized over chunks
+        # Recurrent linear attention with exponential decay
         CHUNK = 64
         outputs = []
         S = torch.zeros(bsz, H, D, D, device=x.device, dtype=torch.float32)
@@ -513,8 +509,10 @@ class LinearAttention(nn.Module):
 
             chunk_out = torch.zeros_like(v_chunk)
             for t in range(chunk_len):
-                S = S * decay + k_chunk[:, :, t:t+1, :].transpose(-1, -2) @ v_chunk[:, :, t:t+1, :]
-                chunk_out[:, :, t:t+1, :] = q_chunk[:, :, t:t+1, :] @ S
+                k_t = k_chunk[:, :, t, :]  # [B, H, D]
+                v_t = v_chunk[:, :, t, :]  # [B, H, D]
+                S = S * decay + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)  # [B, H, D, D]
+                chunk_out[:, :, t, :] = torch.einsum('bhd,bhde->bhe', q_chunk[:, :, t, :], S)
 
             outputs.append(chunk_out)
 
