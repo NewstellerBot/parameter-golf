@@ -1413,7 +1413,8 @@ def main() -> None:
                 for p in matrix_params:
                     p.mul_(1.0 - args.muon_wd * optimizer_muon.param_groups[0]["lr"])
         # SWA: collect weight snapshots during warmdown
-        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+        swa_frac = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
+        if args.swa_enabled and swa_frac >= (1.0 - args.swa_start_frac) and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
