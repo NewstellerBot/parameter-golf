@@ -11,7 +11,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Python deps not in NGC image
-RUN pip install --no-cache-dir sentencepiece huggingface-hub datasets tiktoken
+RUN pip install --no-cache-dir sentencepiece huggingface-hub datasets tiktoken zstandard
 
 # Copy our code
 COPY train_gpt.py .
