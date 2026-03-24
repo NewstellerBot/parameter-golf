@@ -1009,12 +1009,14 @@ def main() -> None:
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+            progress = min(step / max(args.warmdown_iters, 1), 1.0)
+        else:
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            progress = 1.0 - min(remaining_ms / max(warmdown_ms, 1e-9), 1.0)
+        # Cosine decay: spends more time at high LR than linear
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
@@ -1045,8 +1047,8 @@ def main() -> None:
     # MAIN TRAINING LOOP
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
+    ema_state: dict[str, Tensor] | None = None
+    ema_decay = 0.997
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1109,16 +1111,15 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-        # SWA: collect checkpoints during warmdown
-        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
-            if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
+        # EMA: exponential moving average of weights (starts at 40% of training)
+        ema_frac = approx_training_time_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
+        if args.swa_enabled and ema_frac >= 0.4:
+            if ema_state is None:
+                ema_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                log0(f"ema:start step:{step} decay={ema_decay}")
             else:
                 for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
+                    ema_state[name].lerp_(t.detach().cpu(), 1.0 - ema_decay)
 
         should_log_train = (
             args.train_log_every > 0
@@ -1144,14 +1145,14 @@ def main() -> None:
     )
 
     # Apply SWA if collected
-    if args.swa_enabled and swa_state is not None and swa_count > 1:
-        log0(f"swa:applying averaged {swa_count} checkpoints")
+    if args.swa_enabled and ema_state is not None:
+        log0(f"ema:applying")
         current_state = base_model.state_dict()
-        avg_state = {
-            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
-            for name, tensor in swa_state.items()
+        ema_loaded = {
+            name: tensor.to(dtype=current_state[name].dtype)
+            for name, tensor in ema_state.items()
         }
-        base_model.load_state_dict(avg_state, strict=True)
+        base_model.load_state_dict(ema_loaded, strict=True)
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
     if master_process:
