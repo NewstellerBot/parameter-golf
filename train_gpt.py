@@ -540,11 +540,14 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, v0: Tensor | None = None, vr_lambda: float = 0.0) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        raw_v = v  # cache for value residual
+        if v0 is not None and vr_lambda > 0:
+            v = (1 - vr_lambda) * v + vr_lambda * v0
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -556,7 +559,7 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(y), raw_v
 
 
 class MLP(nn.Module):
@@ -622,13 +625,13 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, v0: Tensor | None = None, vr_lambda: float = 0.0) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out, raw_v = self.attn(self.attn_norm(x), v0=v0, vr_lambda=vr_lambda)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        return x, raw_v
 
 
 class GPT(nn.Module):
@@ -669,6 +672,9 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        # Value Residual: per-layer lambda, linearly decreasing (layer 0 = 1.0, last = 0.1)
+        vr_init = torch.linspace(1.0, 0.1, num_layers)
+        self.vr_lambda = nn.Parameter(vr_init)
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -695,14 +701,20 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
+        v0: Tensor | None = None
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            lam = self.vr_lambda[i].clamp(0, 1).item() if v0 is not None else 0.0
+            x, raw_v = self.blocks[i](x, x0, v0=v0, vr_lambda=lam)
+            if v0 is None:
+                v0 = raw_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            li = self.num_encoder_layers + i
+            lam = self.vr_lambda[li].clamp(0, 1).item()
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x, _ = self.blocks[li](x, x0, v0=v0, vr_lambda=lam)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -721,14 +733,20 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
+        v0: Tensor | None = None
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            lam = self.vr_lambda[i].clamp(0, 1).item() if v0 is not None else 0.0
+            x, raw_v = self.blocks[i](x, x0, v0=v0, vr_lambda=lam)
+            if v0 is None:
+                v0 = raw_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            li = self.num_encoder_layers + i
+            lam = self.vr_lambda[li].clamp(0, 1).item()
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x, _ = self.blocks[li](x, x0, v0=v0, vr_lambda=lam)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight) + self.output_bias
@@ -938,6 +956,7 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
     scalar_params.append(base_model.output_bias)
+    scalar_params.append(base_model.vr_lambda)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
 
