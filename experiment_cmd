@@ -1,0 +1,16 @@
+  RUN_ID=fair_30L_int4 \
+  TRAIN_BATCH_TOKENS=262144 TRAIN_SEQ_LEN=1024 \
+  MAX_WALLCLOCK_SECONDS=1800 NUM_LAYERS=30 QAT_BITS=4 \
+  torchrun --standalone --nproc_per_node=1 train_gpt.py
+
+
+RUN_ID=19L_clean \
+TRAIN_BATCH_TOKENS=262144 \
+TRAIN_SEQ_LEN=1024 \
+MAX_WALLCLOCK_SECONDS=600 \
+NUM_LAYERS=19 \
+BIGRAM_VOCAB_SIZE=0 \
+SMEARGATE=0 \
+SWA_ENABLED=0 \
+QAT_BITS=0 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py
